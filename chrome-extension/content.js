@@ -14,7 +14,7 @@
     debug: false,
     // How long a tile must remain in the "speaking" state before we emit
     // a start event. Filters out the rapid flicker Meet shows on attack.
-    speakStartMs: 120,
+    speakStartMs: 60,
     // How long a tile must remain quiet before we emit an end event.
     // Bridges short pauses inside a continuous utterance.
     speakEndMs: 350,
@@ -177,12 +177,11 @@
   // keyed by tileId so it survives tile re-renders within the same
   // session. detachMutationObserver() is called on tile-leave to
   // stop the observer and free the reference.
-  const SPEAK_WINDOW_MS = 1000;
-  // Empirical: the gjg47c↔wEsLMd flip + the per-bar transform classes
-  // produce ~5–8 mutations/sec under continuous speech. Hover/focus
-  // animations on a single button burst to ~3 once and stop. Threshold
-  // sits comfortably between.
-  const SPEAK_MUTATION_THRESHOLD = 4;
+  // 500ms window with threshold 3 detects speech onset in ~250ms and
+  // speech end in ~one window length. Tightening further (250ms / 2)
+  // started flagging hover-tooltip bursts as speech in testing.
+  const SPEAK_WINDOW_MS = 500;
+  const SPEAK_MUTATION_THRESHOLD = 3;
 
   const tileObservers = new Map();   // tileId -> { observer, tile, hits: number[] }
 
@@ -230,11 +229,25 @@
     return entry.hits.length;
   }
 
+  // The PiP self-tile lives inside [jscontroller="tzb3H"]. Meet animates
+  // its mic-bars off the LOCAL mic input regardless of conference mute
+  // state — speaking-while-muted still flickers the bars as a "you're
+  // muted" hint — so mutation rate would falsely flag the local user.
+  // The VoxTerm-side diarizer already handles the local user's audio,
+  // so the Meet bridge only needs to attribute remote speakers.
+  function isSelfTile(tile) {
+    return !!tile.closest("[jscontroller='tzb3H']");
+  }
+
   function detectSpeakers(tiles) {
     const result = new Map();
     for (const tile of tiles) {
       const id = tileId(tile);
       if (!id) continue;
+      if (isSelfTile(tile)) {
+        result.set(tile, false);
+        continue;
+      }
       attachMutationObserver(tile, id);
       const rate = tileMutationRate(id);
       result.set(tile, rate >= SPEAK_MUTATION_THRESHOLD);
@@ -530,14 +543,14 @@
   // Driver
   // ---------------------------------------------------------------------
 
-  // Poll at 10Hz. MutationObserver alone doesn't catch the audio-level
-  // animations (those are pure style changes that don't fire mutations
-  // for attribute or child changes), so we sample. 10Hz comfortably
-  // beats Meet's ~5Hz indicator update rate.
+  // Poll at 20Hz. The MutationObserver itself is event-driven, so this
+  // loop only re-evaluates the rolling rate, runs findTiles to catch
+  // joiners/leavers, and drives transition() debouncing. 20Hz keeps
+  // START latency under ~250ms.
   let pollTimer = null;
   function startPolling() {
     if (pollTimer) return;
-    pollTimer = setInterval(scanOnce, 100);
+    pollTimer = setInterval(scanOnce, 50);
   }
   function stopPolling() {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
