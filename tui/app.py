@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -505,7 +506,14 @@ class VoxTerm(App):
         self._had_speech = False
         self._silence_chunks = 0
         self._transcribing = threading.Event()  # set = busy, clear = idle
-        self._transcribe_lock = threading.Lock()  # serialize MLX GPU access
+        # Single persistent worker thread for ALL MLX work (load, swap, transcribe).
+        # MLX's Metal CommandEncoder is thread_local — every GPU op MUST run on
+        # the same thread that created the stream, otherwise we get
+        # "There is no Stream(gpu, N) in current thread". Pinning to one
+        # worker also serialises submissions, so no extra lock is needed.
+        self._mlx_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mlx-worker",
+        )
         self._transcribe_started: float = 0.0
         self._debug = False
         self._last_dbg: float = 0.0
@@ -973,9 +981,9 @@ class VoxTerm(App):
             return
 
         self._had_speech = False
-        self._transcribe_audio(audio, local_audio)
+        # Run on the dedicated MLX worker thread (see __init__).
+        self._mlx_executor.submit(self._transcribe_audio, audio, local_audio)
 
-    @work(thread=True, group="transcription")
     def _transcribe_audio(self, audio: np.ndarray, local_audio: np.ndarray | None = None):
         # Use local-only audio for diarization to avoid peer audio corrupting embeddings.
         # If local_audio is unavailable (party mode with no local capture), we cannot
@@ -994,11 +1002,10 @@ class VoxTerm(App):
                     f"[dbg] transcribing {duration:.1f}s audio..."
                 )
             # 1. Transcribe (Qwen3: ~100ms, Whisper: ~2-4s)
-            # MLX Metal command buffers are NOT thread-safe — concurrent GPU
-            # submissions from multiple Textual workers cause segfaults.
-            # Serialize with a lock.
-            with self._transcribe_lock:
-                result = self.transcriber.transcribe(audio)
+            # Already on the dedicated MLX worker thread, so no lock needed —
+            # the executor serialises submissions and keeps the thread-local
+            # Metal CommandEncoder consistent.
+            result = self.transcriber.transcribe(audio)
 
             # Periodic GC to prevent MLX memory buildup
             self._transcribe_count += 1
@@ -1311,60 +1318,66 @@ class VoxTerm(App):
             pass  # never block transcription on I/O failure
 
     def _load_model(self):
-        """Start model loading in a plain thread (not @work — avoids fd inheritance bugs)."""
-        def _do_load():
-            try:
-                # Python 3.12 subprocess/multiprocessing fails with
-                # "bad value(s) in fds_to_keep" when spawned from a thread
-                # while Textual holds terminal FDs open.
-                #
-                # The previous patch on subprocess.Popen.__init__ didn't help
-                # because multiprocessing.util.spawnv_passfds calls
-                # _posixsubprocess.fork_exec directly, bypassing Popen.
-                # Patch at the C-level entry point to sanitize fds_to_keep.
-                if sys.platform != "win32":
-                    import _posixsubprocess
-                    if not getattr(_posixsubprocess, '_vt_patched', False):
-                        _orig_fe = _posixsubprocess.fork_exec
-                        def _safe_fork_exec(*args):
-                            largs = list(args)
-                            fds = largs[3]  # fds_to_keep (sorted tuple of ints)
-                            if fds:
-                                clean = tuple(
-                                    fd for fd in fds
-                                    if isinstance(fd, int) and 0 <= fd <= 2**31
-                                )
-                                largs[3] = clean
-                            try:
-                                return _orig_fe(*largs)
-                            except ValueError:
-                                largs[3] = ()
-                                return _orig_fe(*largs)
-                        _posixsubprocess.fork_exec = _safe_fork_exec
-                        _posixsubprocess._vt_patched = True
+        """Load the transcription model on the dedicated MLX worker thread.
 
-                model_repo = AVAILABLE_MODELS[self._model_name]
-                if self._model_name in LLAMA_SERVER_MODELS:
-                    server_url = LLAMA_SERVER_URL
-                    self.transcriber = LlamaServerTranscriber(
-                        server_url=server_url, model=model_repo, language=self._language,
-                    )
-                elif self._model_name in QWEN3_MODELS:
-                    self.transcriber = Qwen3Transcriber(model=model_repo, language=self._language)
-                elif self._model_name in FASTER_WHISPER_MODELS:
-                    self.transcriber = FasterWhisperTranscriber(model=model_repo, language=self._language)
-                else:
-                    self.transcriber = WhisperTranscriber(model=model_repo)
-                self.transcriber.load()
-                self.call_from_thread(self._on_model_loaded)
-            except Exception as e:
-                import traceback
-                tb = traceback.format_exc()
-                self.call_from_thread(
-                    self.query_one(TranscriptPanel).system_message,
-                    f"model load failed: {e}\n{tb}"
+        The model is loaded on the same thread that will later run
+        transcribe(); MLX's CommandEncoder is thread_local so the GPU stream
+        must be created and used on the same OS thread.
+        """
+        self._mlx_executor.submit(self._do_load_model)
+
+    def _do_load_model(self):
+        try:
+            # Python 3.12 subprocess/multiprocessing fails with
+            # "bad value(s) in fds_to_keep" when spawned from a thread
+            # while Textual holds terminal FDs open.
+            #
+            # The previous patch on subprocess.Popen.__init__ didn't help
+            # because multiprocessing.util.spawnv_passfds calls
+            # _posixsubprocess.fork_exec directly, bypassing Popen.
+            # Patch at the C-level entry point to sanitize fds_to_keep.
+            if sys.platform != "win32":
+                import _posixsubprocess
+                if not getattr(_posixsubprocess, '_vt_patched', False):
+                    _orig_fe = _posixsubprocess.fork_exec
+                    def _safe_fork_exec(*args):
+                        largs = list(args)
+                        fds = largs[3]  # fds_to_keep (sorted tuple of ints)
+                        if fds:
+                            clean = tuple(
+                                fd for fd in fds
+                                if isinstance(fd, int) and 0 <= fd <= 2**31
+                            )
+                            largs[3] = clean
+                        try:
+                            return _orig_fe(*largs)
+                        except ValueError:
+                            largs[3] = ()
+                            return _orig_fe(*largs)
+                    _posixsubprocess.fork_exec = _safe_fork_exec
+                    _posixsubprocess._vt_patched = True
+
+            model_repo = AVAILABLE_MODELS[self._model_name]
+            if self._model_name in LLAMA_SERVER_MODELS:
+                server_url = LLAMA_SERVER_URL
+                self.transcriber = LlamaServerTranscriber(
+                    server_url=server_url, model=model_repo, language=self._language,
                 )
-        threading.Thread(target=_do_load, daemon=True, name="model-loader").start()
+            elif self._model_name in QWEN3_MODELS:
+                self.transcriber = Qwen3Transcriber(model=model_repo, language=self._language)
+            elif self._model_name in FASTER_WHISPER_MODELS:
+                self.transcriber = FasterWhisperTranscriber(model=model_repo, language=self._language)
+            else:
+                self.transcriber = WhisperTranscriber(model=model_repo)
+            self.transcriber.load()
+            self.call_from_thread(self._on_model_loaded)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.call_from_thread(
+                self.query_one(TranscriptPanel).system_message,
+                f"model load failed: {e}\n{tb}"
+            )
 
     def _on_model_loaded(self):
         self._model_loaded = True
@@ -1696,15 +1709,25 @@ class VoxTerm(App):
         self._model_loaded = False
         self._model_name = model_key
         self._update_telemetry()
-        # Free old model memory before loading the new one
-        self.transcriber._model = None
         self.query_one(TranscriptPanel).system_message(
             f"switching to {model_key} (may take a minute)...", Log.SYS, {model_key: "rainbow"}
         )
-        self._do_swap(model_key)
+        # Run swap on the same MLX worker thread that holds the GPU stream.
+        # Both releasing the old model and loading the new one must happen
+        # there so MLX tensors are deallocated/created on the right thread.
+        self._mlx_executor.submit(self._do_swap, model_key)
 
-    @work(thread=True, exclusive=True, group="model_loading")
     def _do_swap(self, model_key: str):
+        # Free old model memory on this (MLX worker) thread before loading
+        # the new one — MLX tensors must be released on the thread that
+        # owns the GPU stream.
+        if self.transcriber is not None:
+            try:
+                self.transcriber._model = None
+            except Exception:
+                pass
+            gc.collect()
+
         repo = AVAILABLE_MODELS[model_key]
         try:
             if model_key in LLAMA_SERVER_MODELS:
@@ -1975,6 +1998,13 @@ class VoxTerm(App):
         self._record_session_stats()
         try:
             self.speaker_store.close()
+        except Exception:
+            pass
+
+        # Stop accepting new MLX work; pending transcription submissions are
+        # cancelled. The hard-exit timer below will tear down the worker.
+        try:
+            self._mlx_executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
 

@@ -87,27 +87,26 @@ def _check_linux_tools() -> bool:
     return False
 
 
-def _load_transcriber(model_name: str, model_repo: str, language: str):
-    """Load the transcription model (same logic as app.py __main__)."""
+def _build_transcriber(model_name: str, model_repo: str, language: str):
+    """Construct the transcriber WITHOUT loading the model.
+
+    Loading is deferred to the dictation loop's MLX worker thread so the
+    model and its GPU stream are created on the same OS thread that runs
+    transcribe(). MLX's Metal CommandEncoder is thread_local; loading on
+    the main thread and transcribing on a worker raises
+    "There is no Stream(gpu, N) in current thread".
+    """
     from audio.transcriber import (
         FasterWhisperTranscriber,
         Qwen3Transcriber,
         WhisperTranscriber,
     )
 
-    print(f"VOXTERM DICTATION // loading model ({model_name}) lang={language}...")
-    print("(first run downloads the model, please wait)\n")
-
     if model_name in QWEN3_MODELS:
-        transcriber = Qwen3Transcriber(model=model_repo, language=language)
-    elif model_name in FASTER_WHISPER_MODELS:
-        transcriber = FasterWhisperTranscriber(model=model_repo, language=language)
-    else:
-        transcriber = WhisperTranscriber(model=model_repo)
-
-    transcriber.load()
-    print("Model ready.\n")
-    return transcriber
+        return Qwen3Transcriber(model=model_repo, language=language)
+    if model_name in FASTER_WHISPER_MODELS:
+        return FasterWhisperTranscriber(model=model_repo, language=language)
+    return WhisperTranscriber(model=model_repo)
 
 
 def _write_pid_file() -> None:
@@ -174,9 +173,9 @@ def main() -> None:
         print(f"Unsupported platform: {CURRENT_PLATFORM}", file=sys.stderr)
         sys.exit(1)
 
-    # ---- Load model ----
+    # ---- Build transcriber (model not loaded yet) ----
     model_repo = AVAILABLE_MODELS[args.model]
-    transcriber = _load_transcriber(args.model, model_repo, args.language)
+    transcriber = _build_transcriber(args.model, model_repo, args.language)
 
     # ---- Create components ----
     from dictation.injector import get_injector
@@ -198,6 +197,14 @@ def main() -> None:
         on_state_change=indicator.set_state,
     )
 
+    # Load the model on the loop's dedicated MLX worker thread — this is
+    # the same thread that will run transcribe(), so the Metal stream stays
+    # accessible.
+    print(f"VOXTERM DICTATION // loading model ({args.model}) lang={args.language}...")
+    print("(first run downloads the model, please wait)\n")
+    loop.load_model()
+    print("Model ready.\n")
+
     def toggle_dictation():
         if loop.is_active:
             loop.stop()
@@ -208,7 +215,7 @@ def main() -> None:
 
     # Wire quit
     def quit_all():
-        loop.stop()
+        loop.shutdown()
         hotkey.stop()
         indicator.stop()
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -53,6 +54,36 @@ class DictationLoop:
         self._chunk_duration = CHUNK_SIZE / SAMPLE_RATE
 
         self._thread: threading.Thread | None = None
+
+        # Single persistent worker thread for ALL MLX work (load + transcribe).
+        # MLX's Metal CommandEncoder is thread_local — every GPU op MUST run
+        # on the same thread that created the stream, otherwise we get
+        # "There is no Stream(gpu, N) in current thread". Pinning to one
+        # worker also serialises submissions, so no extra lock is needed.
+        self._mlx_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mlx-worker",
+        )
+        self._model_loaded = bool(getattr(transcriber, "is_loaded", False))
+
+    def load_model(self) -> None:
+        """Load the transcription model on the dedicated MLX worker thread.
+
+        Blocks until loading completes. Must be called before start().
+        Calling more than once is a no-op.
+        """
+        if self._model_loaded:
+            return
+        future = self._mlx_executor.submit(self.transcriber.load)
+        future.result()  # propagate exceptions, wait for completion
+        self._model_loaded = True
+
+    def shutdown(self) -> None:
+        """Stop the loop and tear down the MLX worker."""
+        self.stop()
+        try:
+            self._mlx_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
 
     @property
     def is_active(self) -> bool:
@@ -151,9 +182,9 @@ class DictationLoop:
         self._transcribing.set()
         self._transcribe_started = time.time()
         self._on_state_change("transcribing")
-        threading.Thread(
-            target=self._transcribe_worker, args=(audio,), daemon=True,
-        ).start()
+        # Submit to the dedicated MLX worker thread so transcription runs on
+        # the same OS thread that holds the GPU stream.
+        self._mlx_executor.submit(self._transcribe_worker, audio)
 
     def _transcribe_worker(self, audio: np.ndarray) -> None:
         """Transcribe audio and inject text into focused app."""
