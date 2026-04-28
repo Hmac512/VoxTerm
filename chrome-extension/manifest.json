@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "VoxTerm Meet Bridge",
+  "version": "0.1.0",
+  "description": "Streams active-speaker events from Google Meet to a local VoxTerm recorder.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://meet.google.com/*",
+    "http://localhost/*",
+    "ws://localhost/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://meet.google.com/*"],
+      "js": ["page.js"],
+      "run_at": "document_start",
+      "all_frames": false,
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://meet.google.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "VoxTerm Meet Bridge"
+  }
+}

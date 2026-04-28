@@ -103,6 +103,7 @@ def _clipboard_cmd() -> list[str] | None:
 
 
 from network.party import PartyManager, PartyState, P2P_AVAILABLE as _P2P_AVAILABLE
+from network.meet_bridge import MeetBridge
 
 from config import ConfigStore
 
@@ -536,6 +537,10 @@ class VoxTerm(App):
         # P2P party manager — owns all P2P state and logic
         self._party = PartyManager(self, _get_config())
         self._wire_party_callbacks()
+        # Meet bridge — receives speaker-attribution events from the
+        # Chrome extension over a localhost WebSocket and lets us tag
+        # transcript segments with real participant names.
+        self._meet_bridge = MeetBridge()
 
     def compose(self) -> ComposeResult:
         yield CyberHeader()
@@ -669,6 +674,36 @@ class VoxTerm(App):
         # Start P2P peer discovery on launch (passive — just show who's nearby)
         if _P2P_AVAILABLE:
             self._party_start_passive_discovery_worker()
+
+        # Start the Meet bridge listener. Failures here (port in use,
+        # websockets package missing) are non-fatal — Meet attribution
+        # is opt-in and the rest of the app is unaffected.
+        def _on_meet_listening(host, port, error):
+            tp = self.query_one(TranscriptPanel)
+            if error:
+                self.call_from_thread(
+                    tp.system_message,
+                    f"meet bridge: bind failed on {host}:{port} — {error}",
+                    Log.SYS,
+                )
+            else:
+                self.call_from_thread(
+                    tp.system_message,
+                    f"meet bridge listening on ws://{host}:{port}/meet",
+                    Log.SYS,
+                )
+
+        def _on_meet_client_change(count):
+            tp = self.query_one(TranscriptPanel)
+            msg = "meet extension connected" if count > 0 else "meet extension disconnected"
+            self.call_from_thread(tp.system_message, msg, Log.SYS)
+
+        self._meet_bridge.on_listening = _on_meet_listening
+        self._meet_bridge.on_client_change = _on_meet_client_change
+        try:
+            self._meet_bridge.start()
+        except Exception:
+            log.warning("MeetBridge failed to start", exc_info=True)
 
     @property
     def _chunk_duration(self) -> float:
@@ -1084,20 +1119,39 @@ class VoxTerm(App):
                 segments = [("", 0, 0, len(audio))]
 
             if text:
+                # Wall-clock anchor for Meet attribution: the audio buffer
+                # ends ~ when transcription was triggered, and starts one
+                # buffer-duration earlier. Per-segment ranges scale from
+                # there using sample offsets.
+                audio_end_ms = (self._transcribe_started or time.time()) * 1000.0
+                audio_dur_ms = (len(audio) / SAMPLE_RATE) * 1000.0
+                audio_start_ms = audio_end_ms - audio_dur_ms
+
+                def _segment_wall_range(start_sample: int, end_sample: int) -> tuple[float, float]:
+                    s = audio_start_ms + (start_sample / SAMPLE_RATE) * 1000.0
+                    e = audio_start_ms + (end_sample / SAMPLE_RATE) * 1000.0
+                    return s, e
+
                 if len(segments) > 1:
                     # Split text across segments proportionally by duration
                     seg_texts = self._split_text_by_segments(text, segments)
-                    for seg_text, seg_label, seg_sid in seg_texts:
+                    for (seg_text, seg_label, seg_sid), (_, _, s_start, s_end) in zip(seg_texts, segments):
                         if seg_text.strip():
                             seg_overlap = is_overlap and seg_sid == speaker_id
+                            t0, t1 = _segment_wall_range(s_start, s_end)
+                            meet_name = self._meet_bridge.attribute(t0, t1)
+                            label_out = meet_name or seg_label
                             self.call_from_thread(
-                                self._on_transcription, seg_text, seg_label,
+                                self._on_transcription, seg_text, label_out,
                                 seg_sid, confidence,
                                 seg_overlap,
                             )
                 else:
+                    t0, t1 = audio_start_ms, audio_end_ms
+                    meet_name = self._meet_bridge.attribute(t0, t1)
+                    label_out = meet_name or speaker_label
                     self.call_from_thread(
-                        self._on_transcription, text, speaker_label,
+                        self._on_transcription, text, label_out,
                         speaker_id, confidence,
                         is_overlap,
                     )
@@ -1998,6 +2052,10 @@ class VoxTerm(App):
         self._record_session_stats()
         try:
             self.speaker_store.close()
+        except Exception:
+            pass
+        try:
+            self._meet_bridge.stop()
         except Exception:
             pass
 
